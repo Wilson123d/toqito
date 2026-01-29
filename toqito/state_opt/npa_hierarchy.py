@@ -217,7 +217,7 @@ def _is_meas_on_one_player(word: tuple[Symbol, ...]) -> bool:
 
 
 # _get_nonlocal_game_params remains the same as in npa_constraints_fix
-def _get_nonlocal_game_params(
+def _get_params(
     assemblage: dict[tuple[int, int], cvxpy.Variable], referee_dim: int = 1
 ) -> tuple[int, int, int, int]:
     a_in, b_in = max(assemblage.keys())
@@ -229,172 +229,65 @@ def _get_nonlocal_game_params(
     return a_out, a_in, b_out, b_in
 
 
-def npa_constraints(
-    assemblage: dict[tuple[int, int], cvxpy.Variable], k: int | str = 1, referee_dim: int = 1, no_signaling: bool = True
-) -> list[cvxpy.constraints.constraint.Constraint]:
-    r"""Generate the constraints specified by the NPA hierarchy up to a finite level.
-
-    :footcite:`Navascues_2008_AConvergent`
-
-    You can determine the level of the hierarchy by a positive integer or a string
-    of a form like "1+ab+aab", which indicates that an intermediate level of the hierarchy
-    should be used, where this example uses all products of 1 measurement, all products of
-    one Alice and one Bob measurement, and all products of two Alice and one Bob measurement.
-
-    The commuting measurement assemblage operator must be given as a dictionary. The keys are
-    tuples of Alice and Bob questions :math:`x, y` and the values are cvxpy Variables which
-    are matrices with entries:
-
-    .. math::
-        K_{xy}\Big(i + a \cdot dim_R, j + b \cdot dim_R \Big) =
-        \langle i| \text{Tr}_{\mathcal{H}} \Big( \big(
-            I_R \otimes A_a^x B_b^y \big) \sigma \Big) |j \rangle
-
-    References
-    ==========
-    .. footbibliography::
-
-
-    :param assemblage: The commuting measurement assemblage operator.
-    :param k: The level of the NPA hierarchy to use (default=1).
-    :param referee_dim: The dimension of the referee's quantum system (default=1).
-    :return: A list of cvxpy constraints.
-
-    """
-    a_out, a_in, b_out, b_in = _get_nonlocal_game_params(assemblage, referee_dim)
-
+def npa_constraints(assemblage, k=1, referee_dim=1, no_signaling: bool = True):
+    a_out, a_in, b_out, b_in = _get_params(assemblage, referee_dim)
     words = _gen_words(k, a_out, a_in, b_out, b_in)
-    dim = len(words)
+    if not words:
+        raise ValueError("Generated word list is empty.")
+    dim, dR = len(words), referee_dim
+    word_to_idx = {word: i for i, word in enumerate(words)}
+    
+    moment_matrix = cvxpy.Variable((dR * dim, dR * dim), hermitian=True)
+    constraints = [moment_matrix >> 0]
+    
+    rho_R = moment_matrix[0:dR, 0:dR]
+    constraints.append(cvxpy.trace(rho_R) == 1)
 
-    if dim == 0:
-        # Should not happen if IDENTITY_SYMBOL is always included
-        raise ValueError("Generated word list is empty. Check _gen_words logic.")
+    # Link moment matrix to the assemblage for basis operators
+    seen_products = {}
+    for i, word_i in enumerate(words):
+        for j, word_j in enumerate(words):
+            if i > j: continue
+            block = moment_matrix[i*dR:(i+1)*dR, j*dR:(j+1)*dR]
+            prod = _reduce(tuple(reversed(word_i)) + word_j)
+            
+            if not prod: constraints.append(block == 0); continue
+            if prod in seen_products:
+                p_i, p_j = seen_products[prod]
+                constraints.append(block == moment_matrix[p_i*dR:(p_i+1)*dR, p_j*dR:(p_j+1)*dR]); continue
+            
+            seen_products[prod] = (i, j)
+            if prod == (IDENTITY_SYMBOL,):
+                constraints.append(block == rho_R)
+            elif len(prod) == 2 and prod[0].player=="Alice" and prod[1].player=="Bob":
+                s_a, s_b = prod; x, a, y, b = s_a.question, s_a.answer, s_b.question, s_b.answer
+                constraints.append(block == assemblage[x, y][a*dR:(a+1)*dR, b*dR:(b+1)*dR])
+            elif len(prod) == 1 and prod[0].player in PLAYERS:
+                s = prod[0]; x, a = s.question, s.answer
+                if s.player == "Alice":
+                    constraints.append(block == sum(assemblage[x,0][a*dR:(a+1)*dR, b_idx*dR:(b_idx+1)*dR] for b_idx in range(b_out)))
+                else:
+                    constraints.append(block == sum(assemblage[0,x][a_idx*dR:(a_idx+1)*dR, a*dR:(a+1)*dR] for a_idx in range(a_out)))
 
-    # Moment matrix (Gamma matrix in :footcite:`Navascues_2008_AConvergent`)
-    # moment_matrix_R block corresponds to E[S_i^dagger S_j]
-    moment_matrix_R = cvxpy.Variable((referee_dim * dim, referee_dim * dim), hermitian=True, name="R")
+    # CRITICAL FIX: Add constraints for the dependent outcomes
+    for x, y in product(range(a_in), range(b_in)):
+        # Dependent Alice outcome
+        a_last = a_out - 1
+        sum_K_a = sum(assemblage[x,y][a*dR:(a+1)*dR, b*dR:(b+1)*dR] for a in range(a_out-1) for b in range(b_out))
+        K_a_last = sum(assemblage[x,y][a_last*dR:(a_last+1)*dR, b*dR:(b+1)*dR] for b in range(b_out))
+        constraints.append(K_a_last == rho_R - sum_K_a)
+        
+        # Dependent Bob outcome
+        b_last = b_out - 1
+        sum_K_b = sum(assemblage[x,y][a*dR:(a+1)*dR, b*dR:(b+1)*dR] for b in range(b_out-1) for a in range(a_out))
+        K_b_last = sum(assemblage[x,y][a*dR:(a+1)*dR, b_last*dR:(b_last+1)*dR] for a in range(a_out))
+        constraints.append(K_b_last == rho_R - sum_K_b)
 
-    # Referee's effective state rho_R = E[I]
-    # This is the (0,0) block of moment_matrix_R since words[0] is Identity
-    rho_R_referee = moment_matrix_R[0:referee_dim, 0:referee_dim]
-
-    # Ensure rho_R_referee is a valid quantum state
-    constraints = [
-        cvxpy.trace(rho_R_referee) == 1,
-        rho_R_referee >> 0,
-        moment_matrix_R >> 0,
-    ]
-
-    # Store relations for (S_i^dagger S_j) -> block_index in moment_matrix_R
-    # This helps enforce Γ(S_i^dagger S_j) = Γ(S_k^dagger S_l) if products are algebraically equal
-    seen_reduced_products = {}
-
-    for i in range(dim):
-        for j in range(i, dim):  # Iterate over upper triangle including diagonal
-            word_i_conj = tuple(reversed(words[i]))  # S_i^dagger
-
-            # The product S_i^dagger S_j
-            # For _reduce, ensure no IDENTITY_SYMBOL unless it's the only element.
-            # If word_i_conj is (ID,), S_i_dagger_S_j is S_j. If word_j is (ID,), it's S_i_dagger.
-            # If both are (ID,), product is (ID,).
-
-            product_unreduced = []
-            if word_i_conj != (IDENTITY_SYMBOL,):
-                product_unreduced.extend(list(word_i_conj))
-            if words[j] != (IDENTITY_SYMBOL,):
-                product_unreduced.extend(list(words[j]))
-
-            # This happens if both words[i] and words[j] were IDENTITY_SYMBOL
-            if not product_unreduced:
-                product_S_i_adj_S_j = (IDENTITY_SYMBOL,)
-            else:
-                product_S_i_adj_S_j = _reduce(tuple(product_unreduced))
-
-            # Moment matrix (Gamma matrix in NPA paper :footcite:`Navascues_2008_AConvergent` - arXiv:0803.4290)
-            # This hierarchy can be generalized, e.g., to incorporate referee systems
-            # as seen in extended nonlocal games (see, e.g., F. Speelman's thesis, :footcite:`Speelman_2016_Position`).
-            current_block = moment_matrix_R[
-                i * referee_dim : (i + 1) * referee_dim, j * referee_dim : (j + 1) * referee_dim
-            ]
-
-            if _is_zero(product_S_i_adj_S_j):  # Product is algebraically zero
-                constraints.append(current_block == 0)
-            elif _is_identity(product_S_i_adj_S_j):  # Product is identity operator
-                # This occurs for (i,j) where S_i^dagger S_j = I. e.g. S_i = S_j and S_i is unitary (proj).
-                # Or i=0, j=0 (I^dagger I = I).
-                # This means current_block should be rho_R_referee if product_S_i_adj_S_j is I
-                constraints.append(current_block == rho_R_referee)
-
-            # Product is A_a^x B_b^y
-            elif _is_meas(product_S_i_adj_S_j):
-                alice_symbol, bob_symbol = product_S_i_adj_S_j
-                constraints.append(
-                    current_block
-                    == assemblage[alice_symbol.question, bob_symbol.question][
-                        alice_symbol.answer * referee_dim : (alice_symbol.answer + 1) * referee_dim,
-                        bob_symbol.answer * referee_dim : (bob_symbol.answer + 1) * referee_dim,
-                    ]
-                )
-            # Product is A_a^x or B_b^y (i.e., only one player involved)
-            elif _is_meas_on_one_player(product_S_i_adj_S_j):  # Product is A_a^x or B_b^y
-                symbol = product_S_i_adj_S_j[0]
-                if symbol.player == "Alice":
-                    # Sum over Bob's outcomes for a fixed Bob question (e.g., y=0)
-                    # E[A_a^x] = sum_b K_x0(a,b)
-                    sum_over_bob_outcomes = sum(
-                        assemblage[symbol.question, 0][  # Assuming y=0 for Bob's marginal
-                            symbol.answer * referee_dim : (symbol.answer + 1) * referee_dim,
-                            b_ans * referee_dim : (b_ans + 1) * referee_dim,
-                        ]
-                        for b_ans in range(b_out)
-                    )
-                    constraints.append(current_block == sum_over_bob_outcomes)
-                else:  # elif symbol.player == "Bob":
-                    # Sum over Alice's outcomes for a fixed Alice question (e.g., x=0)
-                    # E[B_b^y] = sum_a K_0y(a,b)
-                    sum_over_alice_outcomes = sum(
-                        assemblage[0, symbol.question][  # Assuming x=0 for Alice's marginal
-                            a_ans * referee_dim : (a_ans + 1) * referee_dim,
-                            symbol.answer * referee_dim : (symbol.answer + 1) * referee_dim,
-                        ]
-                        for a_ans in range(a_out)
-                    )
-                    constraints.append(current_block == sum_over_alice_outcomes)
-            elif product_S_i_adj_S_j in seen_reduced_products:
-                # This product S_k has been seen before as S_p^dagger S_q
-                # So, Γ(S_i, S_j) = Γ(S_p, S_q)
-                prev_i, prev_j = seen_reduced_products[product_S_i_adj_S_j]
-                # Make sure to get the upper triangle element if current (i,j) is lower
-                # The prev_i, prev_j should always refer to an upper triangle element by construction.
-                previous_block = moment_matrix_R[
-                    prev_i * referee_dim : (prev_i + 1) * referee_dim, prev_j * referee_dim : (prev_j + 1) * referee_dim
-                ]
-                constraints.append(current_block == previous_block)
-            else:
-                # First time seeing this operator product S_k
-                seen_reduced_products[product_S_i_adj_S_j] = (i, j)
-
-    # Constraints on the assemblage K_xy(a,b) itself --always apply all of these constraints!
-    for x_alice_in in range(a_in):
-        for y_bob_in in range(b_in):
-            # Positivity: K_xy(a,b) >= 0 (operator PSD)
-            for a_alice_out in range(a_out):
-                for b_bob_out in range(b_out):
-                    assemblage_block = assemblage[x_alice_in, y_bob_in][
-                        a_alice_out * referee_dim : (a_alice_out + 1) * referee_dim,
-                        b_bob_out * referee_dim : (b_bob_out + 1) * referee_dim,
-                    ]
-                    constraints.append(assemblage_block >> 0)
-
-            # Normalization: Sum_{a,b} K_xy(a,b) = rho_R
-            sum_over_outcomes_ab = sum(
-                assemblage[x_alice_in, y_bob_in][
-                    a * referee_dim : (a + 1) * referee_dim, b * referee_dim : (b + 1) * referee_dim
-                ]
-                for a in range(a_out)
-                for b in range(b_out)
-            )
-            constraints.append(sum_over_outcomes_ab == rho_R_referee)
+    # Final assemblage positivity and normalization constraints
+    for x, y in product(range(a_in), range(b_in)):
+        for a, b in product(range(a_out), range(b_out)):
+            constraints.append(assemblage[x, y][a*dR:(a+1)*dR, b*dR:(b+1)*dR] >> 0)
+        constraints.append(sum(assemblage[x,y][a*dR:(a+1)*dR, b*dR:(b+1)*dR] for a,b in product(range(a_out),range(b_out))) == rho_R)
     if no_signaling:
         # No-signaling constraints on assemblage - ALWAYS APPLY
         # Bob's marginal rho_B(b|y) = Sum_a K_xy(a,b) must be independent of x
@@ -434,6 +327,6 @@ def npa_constraints(
                         ]
                         for b in range(b_out)
                     )
-                    constraints.append(sum_over_b_for_y0 == sum_over_b_for_y_current)
+                    constraints.append(sum_over_b_for_y0 == sum_over_b_for_y_current)    
 
     return constraints
